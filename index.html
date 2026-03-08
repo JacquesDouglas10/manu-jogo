@@ -2,13 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#FF6FB0">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="Manu">
-<link rel="manifest" href="manifest.json">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Aprendendo com a Manu 🌟</title>
 <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@400;700;900&display=swap" rel="stylesheet">
 <style>
@@ -547,8 +541,8 @@ const levels=[
   });
 })();
 
-function updateLevelBests(){
-  const rank=loadRanking();
+async function updateLevelBests(){
+  const rank = await loadRanking();
   levels.forEach(lv=>{
     const entries=rank.filter(e=>e.level===lv.id);
     const best=entries.length?Math.max(...entries.map(e=>e.score)):null;
@@ -561,6 +555,7 @@ function updateLevelBests(){
 
 function goToLevelScreen(){
   stopBgMusic();
+  gameActive = false;
   const n=document.getElementById('player-name-input').value.trim();
   if(!n||selectedAvatar===null)return;
   playerName=n;
@@ -573,28 +568,101 @@ function goBackToAvatar(){
   document.getElementById('avatar-screen').style.display='block';
 }
 
-// RANKING
-const RANK_KEY='manuela_ranking_v2';
-function loadRanking(){try{const r=localStorage.getItem(RANK_KEY);return r?JSON.parse(r):[]; }catch(e){return[];}}
-function saveToRanking(name,av,score,words,lvId){
-  const list=loadRanking();
-  list.push({name,avatar:av,score,words,level:lvId,date:new Date().toLocaleDateString('pt-BR')});
-  list.sort((a,b)=>b.score-a.score);
-  localStorage.setItem(RANK_KEY,JSON.stringify(list.slice(0,30)));
+// ========================
+// RANKING — IndexedDB + localStorage (duplo backup)
+// IndexedDB é persistente no PWA/Safari; localStorage é fallback
+// ========================
+const RANK_KEY = 'manuela_ranking_v2';
+const DB_NAME  = 'ManuDB';
+const DB_STORE = 'ranking';
+let db = null;
+
+function openDB() {
+  return new Promise((resolve) => {
+    if (db) { resolve(db); return; }
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains(DB_STORE)) {
+        d.createObjectStore(DB_STORE, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror   = ()  => resolve(null);
+  });
 }
-function buildRankHTML(listEl,currentName){
-  const data=loadRanking();
-  listEl.innerHTML='';
-  if(!data.length){listEl.innerHTML='<div class="rank-empty">Nenhuma pontuação ainda!<br>Seja o primeiro! 🌟</div>';return;}
-  const medals=['🥇','🥈','🥉'];
-  data.forEach((e,idx)=>{
-    const d=document.createElement('div');
-    const tc=idx<3?`top${idx+1}`:'';
-    const me=e.name===currentName?'highlight':'';
-    d.className=`rank-item ${tc} ${me}`;
-    d.style.animationDelay=(idx*0.04)+'s';
-    const pos=idx<3?medals[idx]:`#${idx+1}`;
-    d.innerHTML=`
+
+async function dbGetAll() {
+  const d = await openDB();
+  if (!d) return null;
+  return new Promise(resolve => {
+    const tx = d.transaction(DB_STORE, 'readonly');
+    const req = tx.objectStore(DB_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror   = () => resolve(null);
+  });
+}
+
+async function dbClearAndPutAll(list) {
+  const d = await openDB();
+  if (!d) return;
+  return new Promise(resolve => {
+    const tx = d.transaction(DB_STORE, 'readwrite');
+    const store = tx.objectStore(DB_STORE);
+    store.clear();
+    list.forEach(item => store.put(item));
+    tx.oncomplete = resolve;
+    tx.onerror    = resolve;
+  });
+}
+
+// Lê de IndexedDB; cai para localStorage se necessário
+async function loadRanking() {
+  try {
+    const rows = await dbGetAll();
+    if (rows && rows.length > 0) {
+      // sincroniza localStorage como backup
+      localStorage.setItem(RANK_KEY, JSON.stringify(rows));
+      return rows;
+    }
+  } catch(e) {}
+  // fallback localStorage
+  try {
+    const r = localStorage.getItem(RANK_KEY);
+    return r ? JSON.parse(r) : [];
+  } catch(e) { return []; }
+}
+
+async function saveToRanking(name, av, score, words, lvId) {
+  let list = await loadRanking();
+  // remove id antes de re-inserir para evitar duplicatas de chave
+  list = list.map(({id, ...rest}) => rest);
+  list.push({ name, avatar: av, score, words, level: lvId,
+               date: new Date().toLocaleDateString('pt-BR') });
+  list.sort((a, b) => b.score - a.score);
+  list = list.slice(0, 30);
+  // salva nos dois lugares
+  try { await dbClearAndPutAll(list); } catch(e) {}
+  try { localStorage.setItem(RANK_KEY, JSON.stringify(list)); } catch(e) {}
+}
+
+async function buildRankHTML(listEl, currentName) {
+  listEl.innerHTML = '<div class="rank-empty">Carregando... ⏳</div>';
+  const data = await loadRanking();
+  listEl.innerHTML = '';
+  if (!data.length) {
+    listEl.innerHTML = '<div class="rank-empty">Nenhuma pontuação ainda!<br>Seja o primeiro! 🌟</div>';
+    return;
+  }
+  const medals = ['🥇','🥈','🥉'];
+  data.forEach((e, idx) => {
+    const d  = document.createElement('div');
+    const tc = idx < 3 ? `top${idx+1}` : '';
+    const me = e.name === currentName ? 'highlight' : '';
+    d.className = `rank-item ${tc} ${me}`;
+    d.style.animationDelay = (idx * 0.04) + 's';
+    const pos = idx < 3 ? medals[idx] : `#${idx+1}`;
+    d.innerHTML = `
       <div class="rank-pos">${pos}</div>
       <div class="rank-av">${e.avatar||'🌟'}</div>
       <div class="rank-info">
@@ -605,19 +673,21 @@ function buildRankHTML(listEl,currentName){
     listEl.appendChild(d);
   });
 }
-function showRankModal(){buildRankHTML(document.getElementById('rank-list-modal'),playerName);document.getElementById('rank-modal-overlay').classList.add('show');}
-function closeRankModal(){document.getElementById('rank-modal-overlay').classList.remove('show');}
-function showRankPanel(){buildRankHTML(document.getElementById('rank-list-final'),playerName);document.getElementById('ranking-panel').classList.add('show');}
-function closeRankPanel(){document.getElementById('ranking-panel').classList.remove('show');}
+
+function showRankModal(){ buildRankHTML(document.getElementById('rank-list-modal'),playerName); document.getElementById('rank-modal-overlay').classList.add('show'); }
+function closeRankModal(){ document.getElementById('rank-modal-overlay').classList.remove('show'); }
+function showRankPanel(){ buildRankHTML(document.getElementById('rank-list-final'),playerName); document.getElementById('ranking-panel').classList.add('show'); }
+function closeRankPanel(){ document.getElementById('ranking-panel').classList.remove('show'); }
 
 // ========================
 // SOM (Web Audio API)
 // ========================
 let audioCtx = null;
 let muted = false;
-let bgMusicNodes = []; // keeps refs to stop music
+let bgMusicNodes = [];
 let bgMusicPlaying = false;
 let bgLoopTimeout = null;
+let gameActive = false; // true enquanto o jogo está rodando
 
 function getAudio() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -633,7 +703,7 @@ function toggleMute() {
   if (muted) {
     stopBgMusic();
   } else {
-    if (bgMusicPlaying) startBgMusic();
+    startBgMusic(); // sempre reinicia — startBgMusic já checa se jogo está ativo
   }
 }
 
@@ -706,7 +776,7 @@ function calcDuration(pattern) {
 }
 
 function startBgMusic() {
-  if (muted) return;
+  if (muted || !gameActive) return;
   stopBgMusic();
   bgMusicPlaying = true;
   try {
@@ -856,6 +926,7 @@ function startGame(){
   document.getElementById('final-screen').classList.remove('show');
   document.getElementById('ranking-panel').classList.remove('show');
   setSpeech(`Olá, ${playerName}! Nível ${lv.id}! ${av.emoji}`);
+  gameActive = true;
   startBgMusic();
   loadWordInit();
 }
@@ -928,10 +999,11 @@ function checkAnswer(){
   }
 }
 function nextWord(){currentWord++;setSpeech(getRandom(messages.next));setFace('happy');loadWordInit();}
-function showFinal(){
+async function showFinal(){
   document.getElementById('game-card').style.display='none';
   document.getElementById('rank-float-btn').classList.remove('visible');
   document.getElementById('mute-btn').classList.remove('visible');
+  gameActive = false;
   stopBgMusic();
   document.getElementById('final-screen').classList.add('show');
   const av=avatars[selectedAvatar];
@@ -940,7 +1012,7 @@ function showFinal(){
   document.getElementById('final-score-text').textContent=`Você fez ${score} pontos em ${currentWord} palavras! ${stars}`;
   setFace('super');setSpeech('Você foi INCRÍVEL! 🏆');animateChar('bounce');launchConfetti();
   playFinish();
-  saveToRanking(playerName,av.emoji,score,currentWord,activeLevelId);
+  await saveToRanking(playerName,av.emoji,score,currentWord,activeLevelId);
   setTimeout(showRankPanel,1500);
 }
 function restartSameLevel(){
@@ -954,6 +1026,7 @@ function restartSameLevel(){
   document.getElementById('game-card').style.display='block';
   document.getElementById('final-screen').classList.remove('show');
   setSpeech(`De novo, ${playerName}! 💪`);
+  gameActive = true;
   startBgMusic();
   loadWordInit();
 }
@@ -970,13 +1043,6 @@ function launchConfetti(){
     el.style.animationDelay=(Math.random()*0.8)+'s';
     wrap.appendChild(el);setTimeout(()=>el.remove(),3500);
   }
-}
-
-// Registra Service Worker (PWA)
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  });
 }
 </script>
 </body>
